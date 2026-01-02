@@ -1,0 +1,48 @@
+# Core LangChain packages
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+langchain-text-splitters>=0.3.0
+
+# Vector store
+faiss-cpu>=1.8.0
+
+# Document loaders
+pypdf>=4.0.0
+unstructured>=0.15.0
+markdown>=3.5.0
+
+# Embeddings (local fallback)
+sentence-transformers>=3.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Optional: Streamlit UI
+streamlit>=1.38.0
+
+# Utilities
+tiktoken>=0.7.0
+
+# Production dependencies
+tenacity>=8.2.0          # Retry logic
+structlog>=24.0.0        # Structured logging
+cachetools>=5.3.0        # Caching
+httpx>=0.27.0            # Async HTTP client
+prometheus-client>=0.20.0  # Metrics
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+
+# Security
+bleach>=6.1.0            # Input sanitization
+
+# Type checking (dev)
+mypy>=1.8.0
+types-PyYAML>=6.0.0
+types-cachetools>=5.3.0

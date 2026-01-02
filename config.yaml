@@ -1,0 +1,42 @@
+# RAG Assistant Configuration
+
+# LLM Settings (via OpenRouter)
+llm:
+  model_name: "openai/gpt-4o-mini"  # OpenRouter model identifier
+  temperature: 0.1                   # Lower = more focused answers
+  max_tokens: 1024                   # Max response length
+  timeout: 60.0                      # Request timeout in seconds
+
+# Retrieval Settings
+retrieval:
+  top_k: 5                           # Number of chunks to retrieve
+  score_threshold: 0.0               # Minimum similarity score (0 = no threshold)
+
+# Chunking Settings
+chunking:
+  chunk_size: 1000                   # Characters per chunk
+  chunk_overlap: 200                 # Overlap between chunks
+
+# Embeddings Settings
+embeddings:
+  # Provider: "sentence-transformers" (local, free) or "openai" (requires API key)
+  provider: "sentence-transformers"
+  # Model name for the chosen provider
+  # For sentence-transformers: "all-MiniLM-L6-v2", "all-mpnet-base-v2", etc.
+  # For openai: "text-embedding-3-small", "text-embedding-3-large", etc.
+  model: "all-MiniLM-L6-v2"
+  batch_size: 32                     # Batch size for embedding generation
+
+# Paths
+paths:
+  documents_dir: "documents"         # Source documents folder
+  index_dir: "data/faiss_index"      # FAISS index storage
+  logs_dir: "logs"                   # Log files
+  cache_dir: "data/cache"            # Cache directory
+
+# Logging Settings
+logging:
+  level: "INFO"                      # DEBUG, INFO, WARNING, ERROR
+  json_format: false                 # Use JSON format for logs (recommended for production)
+  max_bytes: 10485760                # Max log file size (10MB)
+  backup_count: 5                    # Number of backup log files
