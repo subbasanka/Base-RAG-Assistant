@@ -1,0 +1,13 @@
+# Prometheus configuration for RAG Assistant
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'rag-assistant'
+    static_configs:
+      - targets: ['rag-assistant:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+

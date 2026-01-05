@@ -1,0 +1,45 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+ENV/
+.eggs/
+*.egg-info/
+*.egg
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and data (will be mounted)
+logs/
+data/
+
+# Tests
+tests/
+.coverage
+htmlcov/
+
+# Documentation
+*.md
+!README.md
+
+# Misc
+.env
+.env.local
+*.log
+.DS_Store
+Thumbs.db
+
