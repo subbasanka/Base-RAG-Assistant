@@ -1,284 +1,310 @@
-"""HTTP API server for RAG Assistant.
+"""FastAPI server for RAG Assistant.
 
 Provides REST API endpoints for production deployment with health checks,
 metrics, and proper error handling.
 """
 
-import json
-import os
-import sys
 import time
-from dataclasses import asdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Any
-from urllib.parse import parse_qs, urlparse
+from contextlib import asynccontextmanager
+from typing import List, Optional
 
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, Response, BackgroundTasks, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from pydantic import BaseModel, Field
+
+from src.build_index import build_and_save_index
 from src.config import get_config, get_project_root
-from src.exceptions import RAGException, ValidationError
+from src.exceptions import RAGException, ValidationError, ErrorCode
 from src.logging_config import configure_logging, get_logger
 from src.metrics import get_metrics
-from src.rag_chat import RAGAssistant, RAGResponse
-from src.validation import validate_query
+from src.rag_chat import RAGAssistant, RAGResponse, RetrievalResult
 
 logger = get_logger(__name__)
 
+# --- Pydantic Models ---
 
-class RAGRequestHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for RAG Assistant API."""
-    
-    # Class-level assistant instance (shared across requests)
+class QueryRequest(BaseModel):
+    query: str = Field(..., min_length=1, description="The user's question")
+    top_k: Optional[int] = Field(None, ge=1, le=20, description="Number of document chunks to retrieve")
+
+class Source(BaseModel):
+    content: str
+    source: str
+    page: int
+    score: float
+    citation: str
+
+class QueryResponse(BaseModel):
+    answer: str
+    query: str
+    sources: List[Source]
+    latency_ms: float
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: float
+    model: str
+    embeddings: str
+    index_loaded: bool
+
+class ConfigResponse(BaseModel):
+    llm: dict
+    retrieval: dict
+    embeddings: dict
+    environment: str
+
+class UploadResponse(BaseModel):
+    status: str
+    filename: str
+    message: str
+    index_triggered: bool = False
+
+# Supported file types for upload
+SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md"}
+
+# --- Global State & Lifespan ---
+
+class GlobalState:
     assistant: RAGAssistant | None = None
-    
-    def log_message(self, format: str, *args) -> None:
-        """Override to use structured logging."""
-        logger.info(
-            "HTTP request",
-            method=args[0].split()[0] if args else "",
-            path=args[0].split()[1] if args and len(args[0].split()) > 1 else "",
-            status=args[1] if len(args) > 1 else "",
-        )
-    
-    def send_json_response(
-        self,
-        data: dict | list,
-        status_code: int = 200,
-    ) -> None:
-        """Send JSON response."""
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-    
-    def send_error_response(
-        self,
-        message: str,
-        status_code: int = 500,
-        error_code: str | None = None,
-    ) -> None:
-        """Send error response."""
-        error_data = {
-            "error": message,
-            "status": status_code,
-        }
-        if error_code:
-            error_data["code"] = error_code
-        
-        self.send_json_response(error_data, status_code)
-    
-    def do_OPTIONS(self) -> None:
-        """Handle CORS preflight requests."""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-    
-    def do_GET(self) -> None:
-        """Handle GET requests."""
-        parsed = urlparse(self.path)
-        path = parsed.path
-        
-        if path == "/health":
-            self.handle_health()
-        elif path == "/metrics":
-            self.handle_metrics()
-        elif path == "/config":
-            self.handle_config()
-        else:
-            self.send_error_response("Not Found", 404)
-    
-    def do_POST(self) -> None:
-        """Handle POST requests."""
-        parsed = urlparse(self.path)
-        path = parsed.path
-        
-        if path == "/query":
-            self.handle_query()
-        elif path == "/index/rebuild":
-            self.handle_rebuild_index()
-        else:
-            self.send_error_response("Not Found", 404)
-    
-    def handle_health(self) -> None:
-        """Health check endpoint."""
-        try:
-            if self.assistant is None:
-                self.send_json_response({
-                    "status": "unhealthy",
-                    "reason": "Assistant not initialized",
-                }, 503)
-                return
-            
-            health = self.assistant.health_check()
-            self.send_json_response({
-                "status": "healthy",
-                "timestamp": time.time(),
-                **health,
-            })
-        except Exception as e:
-            self.send_json_response({
-                "status": "unhealthy",
-                "reason": str(e),
-            }, 503)
-    
-    def handle_metrics(self) -> None:
-        """Prometheus metrics endpoint."""
-        try:
-            metrics = get_metrics()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(metrics)
-        except Exception as e:
-            self.send_error_response(f"Failed to get metrics: {e}", 500)
-    
-    def handle_config(self) -> None:
-        """Get current configuration (non-sensitive)."""
-        try:
-            config = get_config()
-            self.send_json_response({
-                "llm": {
-                    "model_name": config.llm.model_name,
-                    "temperature": config.llm.temperature,
-                    "max_tokens": config.llm.max_tokens,
-                },
-                "retrieval": {
-                    "top_k": config.retrieval.top_k,
-                },
-                "embeddings": {
-                    "provider": config.embeddings.provider,
-                    "model": config.embeddings.model,
-                },
-                "environment": config.environment,
-            })
-        except Exception as e:
-            self.send_error_response(f"Failed to get config: {e}", 500)
-    
-    def handle_query(self) -> None:
-        """Handle query requests."""
-        try:
-            # Read request body
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length == 0:
-                self.send_error_response("Request body required", 400)
-                return
-            
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode())
-            
-            # Validate query
-            query = data.get("query", "").strip()
-            if not query:
-                self.send_error_response("Query is required", 400)
-                return
-            
-            try:
-                query = validate_query(query)
-            except ValidationError as e:
-                self.send_error_response(str(e), 400, e.code.value)
-                return
-            
-            # Get optional parameters
-            top_k = data.get("top_k")
-            
-            # Ensure assistant is initialized
-            if self.assistant is None:
-                self.send_error_response("Service not ready", 503)
-                return
-            
-            # Process query
-            response = self.assistant.ask(query, top_k=top_k)
-            
-            self.send_json_response(response.to_dict())
-            
-        except json.JSONDecodeError:
-            self.send_error_response("Invalid JSON", 400)
-        except RAGException as e:
-            self.send_error_response(str(e), 500, e.code.value)
-        except Exception as e:
-            logger.exception("Query failed")
-            self.send_error_response(f"Internal error: {e}", 500)
-    
-    def handle_rebuild_index(self) -> None:
-        """Trigger index rebuild."""
-        try:
-            from src.build_index import build_and_save_index
-            
-            build_and_save_index()
-            
-            # Reinitialize assistant
-            RAGRequestHandler.assistant = RAGAssistant()
-            
-            self.send_json_response({
-                "status": "success",
-                "message": "Index rebuilt successfully",
-            })
-        except Exception as e:
-            logger.exception("Index rebuild failed")
-            self.send_error_response(f"Rebuild failed: {e}", 500)
 
+state = GlobalState()
 
-def run_server(
-    host: str = "0.0.0.0",
-    port: int = 8000,
-) -> None:
-    """Run the HTTP API server.
-    
-    Args:
-        host: Host to bind to.
-        port: Port to listen on.
-    """
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     config = get_config()
     project_root = get_project_root()
     
-    # Configure logging
     configure_logging(
         log_dir=project_root / config.paths.logs_dir,
         log_level=config.logging.level,
         json_format=config.is_production,
     )
     
-    logger.info(
-        "Starting RAG Assistant server",
-        host=host,
-        port=port,
-        environment=config.environment,
-    )
+    logger.info("Starting RAG Assistant server", environment=config.environment)
     
-    # Initialize assistant
     try:
-        RAGRequestHandler.assistant = RAGAssistant()
+        state.assistant = RAGAssistant()
+        logger.info("RAG Assistant initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize assistant: {e}")
-        logger.info("Server will start but queries will fail until index is built")
+        # Check if it's a missing index error (expected on first run)
+        error_msg = str(e)
+        if "index" in error_msg.lower() or "E303" in error_msg:
+            logger.info("No index found - server ready for document uploads")
+        else:
+            logger.error(f"Failed to initialize assistant: {e}")
+        logger.info("Server starting without index (upload documents to create one)")
     
-    # Start server
-    server = HTTPServer((host, port), RAGRequestHandler)
+    yield
     
-    logger.info(f"Server listening on http://{host}:{port}")
-    logger.info("Endpoints:")
-    logger.info("  GET  /health  - Health check")
-    logger.info("  GET  /metrics - Prometheus metrics")
-    logger.info("  GET  /config  - Configuration")
-    logger.info("  POST /query   - Query endpoint")
-    logger.info("  POST /index/rebuild - Rebuild index")
+    # Shutdown
+    logger.info("Shutting down RAG Assistant server")
+
+# --- App Initialization ---
+
+app = FastAPI(
+    title="RAG Assistant API",
+    description="Production-ready RAG Assistant API with FastAPI",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Endpoints ---
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - start_time
+    
+    logger.info(
+        "HTTP request",
+        method=request.method,
+        path=request.url.path,
+        status=response.status_code,
+        duration_ms=round(duration * 1000, 2),
+    )
+    return response
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    if not state.assistant:
+        raise HTTPException(status_code=503, detail="Assistant not initialized")
     
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down server")
-        server.shutdown()
+        health = state.assistant.health_check()
+        return {
+            "status": "healthy",
+            "timestamp": time.time(),
+            **health
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
+@app.get("/metrics")
+async def metrics():
+    try:
+        return Response(content=get_metrics(), media_type="text/plain")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get metrics: {e}")
+
+@app.get("/config", response_model=ConfigResponse)
+async def get_configuration():
+    try:
+        config = get_config()
+        return {
+            "llm": {
+                "model_name": config.llm.model_name,
+                "temperature": config.llm.temperature,
+                "max_tokens": config.llm.max_tokens,
+            },
+            "retrieval": {
+                "top_k": config.retrieval.top_k,
+            },
+            "embeddings": {
+                "provider": config.embeddings.provider,
+                "model": config.embeddings.model,
+            },
+            "environment": config.environment,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get config: {e}")
+
+@app.post("/query", response_model=QueryResponse)
+async def query_endpoint(request: QueryRequest):
+    if not state.assistant:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
+    try:
+        # Note: RAGAssistant.ask is currently synchronous
+        # In a real async app, we'd want to make this async or run in a threadpool
+        response = state.assistant.ask(request.query, top_k=request.top_k)
+        
+        # Convert RAGResponse to Pydantic model
+        sources_data = [
+            Source(
+                content=s.content,
+                source=s.source,
+                page=s.page,
+                score=s.score,
+                citation=s.citation
+            ) for s in response.sources
+        ]
+        
+        return QueryResponse(
+            answer=response.answer,
+            query=response.query,
+            sources=sources_data,
+            latency_ms=response.latency_ms
+        )
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RAGException as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("Query failed")
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_document(
+    file: UploadFile = File(...),
+    auto_index: bool = True,
+    background_tasks: BackgroundTasks = None,
+):
+    """Upload a document and optionally trigger index rebuild.
+    
+    Args:
+        file: The document file (PDF, TXT, or MD)
+        auto_index: If True, automatically rebuild the index after upload
+    
+    Returns:
+        Upload status with filename and indexing info
+    """
+    # Validate file extension
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {file_ext}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
+        )
+    
+    # Get documents directory
+    config = get_config()
+    project_root = get_project_root()
+    docs_dir = project_root / config.paths.documents_dir
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create safe filename
+    safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in file.filename)
+    file_path = docs_dir / safe_name
+    
+    # Handle duplicate names
+    counter = 1
+    original_stem = file_path.stem
+    while file_path.exists():
+        file_path = docs_dir / f"{original_stem}_{counter}{file_path.suffix}"
+        counter += 1
+    
+    # Save file
+    try:
+        content = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(content)
+        logger.info(f"Document uploaded: {file_path.name}")
+    except Exception as e:
+        logger.exception("File upload failed")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+    
+    # Trigger index rebuild if requested
+    index_triggered = False
+    if auto_index and background_tasks:
+        background_tasks.add_task(run_rebuild_task)
+        index_triggered = True
+        logger.info("Index rebuild triggered after upload")
+    
+    return UploadResponse(
+        status="success",
+        filename=file_path.name,
+        message=f"File uploaded successfully" + (" - indexing started" if index_triggered else ""),
+        index_triggered=index_triggered,
+    )
+
+def run_rebuild_task():
+    """Background task to rebuild index."""
+    try:
+        logger.info("Starting background index rebuild")
+        build_and_save_index()
+        # Reinitialize assistant to pick up new index
+        state.assistant = RAGAssistant()
+        logger.info("Index rebuild complete and assistant reloaded")
+    except Exception as e:
+        logger.exception("Background index rebuild failed")
+
+@app.post("/index/rebuild")
+async def rebuild_index(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_rebuild_task)
+    return {"status": "accepted", "message": "Index rebuild started in background"}
+
+def run_server(host: str = "0.0.0.0", port: int = 8000):
+    """Run the server using uvicorn."""
+    uvicorn.run("src.server:app", host=host, port=port, reload=False) # Note: assumes this file is src/server.py
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="RAG Assistant API Server")
+    parser = argparse.ArgumentParser(description="RAG Assistant API Server (FastAPI)")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
-    
     args = parser.parse_args()
     
-    run_server(host=args.host, port=args.port)
-
+    uvicorn.run(app, host=args.host, port=args.port)
