@@ -287,6 +287,40 @@ def call_llm(prompt: str, llm: ChatOpenAI, model_name: str) -> str:
         )
 
 
+async def stream_llm(prompt: str, llm: ChatOpenAI, model_name: str):
+    """Stream LLM response tokens.
+    
+    Args:
+        prompt: Formatted prompt.
+        llm: LLM instance.
+        model_name: Model name for metrics.
+        
+    Yields:
+        String chunks as they're generated.
+        
+    Raises:
+        LLMError: If LLM streaming fails.
+    """
+    start_time = time.perf_counter()
+    
+    try:
+        async for chunk in llm.astream(prompt):
+            if chunk.content:
+                yield chunk.content
+        
+        duration = time.perf_counter() - start_time
+        llm_latency.observe(duration)
+        llm_request_counter.labels(model=model_name, status="success").inc()
+        
+    except Exception as e:
+        llm_request_counter.labels(model=model_name, status="error").inc()
+        raise LLMError(
+            f"LLM streaming failed: {e}",
+            code=ErrorCode.LLM_REQUEST_FAILED,
+            cause=e,
+        )
+
+
 def generate_answer(
     query: str,
     sources: List[RetrievalResult],
@@ -411,6 +445,68 @@ class RAGAssistant:
         
         except Exception as e:
             query_counter.labels(status="error").inc()
+            raise
+    
+    async def ask_stream(
+        self,
+        query: str,
+        top_k: int | None = None,
+        use_cache: bool = True,
+    ):
+        """Ask a question and stream the answer with sources.
+        
+        Args:
+            query: User question.
+            top_k: Number of chunks to retrieve.
+            use_cache: Whether to use query caching.
+            
+        Yields:
+            Dict with either 'chunk' (str) for content or 'sources' (list) at the end.
+        """
+        start_time = time.perf_counter()
+        
+        try:
+            # Validate and sanitize query
+            query = validate_query(query)
+            
+            # Retrieve relevant chunks (sync operation)
+            sources = retrieve_context(
+                query,
+                self.vector_store,
+                top_k=top_k,
+                config=self.config,
+                use_cache=use_cache,
+            )
+            
+            # Build prompt
+            prompt = build_prompt(query, sources)
+            
+            # Stream the answer
+            async for chunk in stream_llm(prompt, self.llm, self.config.llm.model_name):
+                yield {"chunk": chunk}
+            
+            # Send sources at the end
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            yield {
+                "sources": [s.to_dict() for s in sources],
+                "latency_ms": latency_ms,
+                "done": True,
+            }
+            
+            # Update metrics
+            query_latency.observe(latency_ms / 1000)
+            query_counter.labels(status="success").inc()
+            
+            logger.info(
+                "Streaming answer complete",
+                query=query[:50],
+                sources=len(sources),
+                latency_ms=round(latency_ms, 2),
+            )
+            
+        except Exception as e:
+            query_counter.labels(status="error").inc()
+            yield {"error": str(e)}
             raise
     
     def format_response(self, response: RAGResponse) -> str:

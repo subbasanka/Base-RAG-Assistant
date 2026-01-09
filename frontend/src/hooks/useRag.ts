@@ -1,52 +1,80 @@
 import { useState, useCallback } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ragApi } from '../api/client';
-import type { Message, Source, QueryResponse } from '../types/api';
+import type { Message, Source } from '../types/api';
 
 // Generate unique IDs
 const generateId = () => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
 /**
- * Hook for managing chat messages and querying the RAG assistant
+ * Hook for managing chat messages with streaming responses
  */
 export function useChat() {
     const [messages, setMessages] = useState<Message[]>([]);
-    const queryClient = useQueryClient();
+    const [isLoading, setIsLoading] = useState(false);
+    const [streamingContent, setStreamingContent] = useState('');
+    const [error, setError] = useState<Error | null>(null);
 
-    const queryMutation = useMutation({
-        mutationFn: ragApi.query,
-        onSuccess: (data: QueryResponse) => {
-            const assistantMessage: Message = {
-                id: generateId(),
-                role: 'assistant',
-                content: data.answer,
-                sources: data.sources,
-                latency_ms: data.latency_ms,
-                timestamp: new Date(),
-            };
-            setMessages(prev => [...prev, assistantMessage]);
-        },
-        onError: (error: Error) => {
-            const errorMessage: Message = {
-                id: generateId(),
-                role: 'assistant',
-                content: `Sorry, I encountered an error: ${error.message}`,
-                timestamp: new Date(),
-            };
-            setMessages(prev => [...prev, errorMessage]);
-        },
-    });
-
-    const sendMessage = useCallback((content: string) => {
+    const sendMessage = useCallback(async (content: string) => {
         const userMessage: Message = {
             id: generateId(),
             role: 'user',
             content: content.trim(),
             timestamp: new Date(),
         };
+
+        const assistantMessageId = generateId();
+
         setMessages(prev => [...prev, userMessage]);
-        queryMutation.mutate({ query: content.trim() });
-    }, [queryMutation]);
+        setIsLoading(true);
+        setStreamingContent('');
+        setError(null);
+
+        try {
+            let fullContent = '';
+            let sources: Source[] = [];
+            let latency_ms: number | undefined;
+
+            for await (const chunk of ragApi.queryStream({ query: content.trim() })) {
+                if (chunk.error) {
+                    throw new Error(chunk.error);
+                }
+
+                if (chunk.chunk) {
+                    fullContent += chunk.chunk;
+                    setStreamingContent(fullContent);
+                }
+
+                if (chunk.done && chunk.sources) {
+                    sources = chunk.sources;
+                    latency_ms = chunk.latency_ms;
+                }
+            }
+
+            const assistantMessage: Message = {
+                id: assistantMessageId,
+                role: 'assistant',
+                content: fullContent,
+                sources,
+                latency_ms,
+                timestamp: new Date(),
+            };
+
+            setMessages(prev => [...prev, assistantMessage]);
+        } catch (e) {
+            const errorMessage: Message = {
+                id: assistantMessageId,
+                role: 'assistant',
+                content: `Sorry, I encountered an error: ${e instanceof Error ? e.message : 'Unknown error'}`,
+                timestamp: new Date(),
+            };
+            setMessages(prev => [...prev, errorMessage]);
+            setError(e instanceof Error ? e : new Error('Unknown error'));
+        } finally {
+            setIsLoading(false);
+            setStreamingContent('');
+        }
+    }, []);
 
     const clearMessages = useCallback(() => {
         setMessages([]);
@@ -56,8 +84,9 @@ export function useChat() {
         messages,
         sendMessage,
         clearMessages,
-        isLoading: queryMutation.isPending,
-        error: queryMutation.error,
+        isLoading,
+        streamingContent,
+        error,
     };
 }
 

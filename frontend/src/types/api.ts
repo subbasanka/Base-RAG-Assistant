@@ -65,3 +65,12 @@ export interface Document {
     size: number;
     type: string;
 }
+
+export interface StreamChunk {
+    chunk?: string;
+    sources?: Source[];
+    latency_ms?: number;
+    done?: boolean;
+    error?: string;
+}
+

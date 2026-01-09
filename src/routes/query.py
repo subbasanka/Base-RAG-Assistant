@@ -1,9 +1,11 @@
 """Query routes for RAG Assistant API."""
 
+import json
 import time
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.dependencies import require_assistant
@@ -70,3 +72,31 @@ async def query(request: QueryRequest, assistant: RAGAssistant = Depends(require
     except Exception as e:
         logger.exception("Query failed")
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+
+
+@router.post("/stream")
+async def query_stream(request: QueryRequest, assistant: RAGAssistant = Depends(require_assistant)):
+    """Stream the RAG assistant response as Server-Sent Events."""
+    
+    async def generate():
+        try:
+            async for data in assistant.ask_stream(request.query, top_k=request.top_k):
+                yield f"data: {json.dumps(data)}\n\n"
+        except ValidationError as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except RAGException as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except Exception as e:
+            logger.exception("Streaming query failed")
+            yield f"data: {json.dumps({'error': f'Internal error: {e}'})}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+

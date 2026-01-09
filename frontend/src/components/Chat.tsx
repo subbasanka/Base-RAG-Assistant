@@ -44,8 +44,8 @@ function MessageBubble({ message }: { message: Message }) {
             <div className={`max-w-[80%] ${isUser ? 'order-2' : ''}`}>
                 <div
                     className={`px-4 py-3 rounded-2xl ${isUser
-                            ? 'bg-primary-600 text-white rounded-br-md'
-                            : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-bl-md shadow-sm border border-gray-100 dark:border-gray-700'
+                        ? 'bg-primary-600 text-white rounded-br-md'
+                        : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-bl-md shadow-sm border border-gray-100 dark:border-gray-700'
                         }`}
                 >
                     <p className="whitespace-pre-wrap">{message.content}</p>
@@ -76,6 +76,18 @@ function MessageBubble({ message }: { message: Message }) {
     );
 }
 
+function StreamingBubble({ content }: { content: string }) {
+    return (
+        <div className="flex justify-start animate-fade-in">
+            <div className="max-w-[80%]">
+                <div className="bg-white dark:bg-gray-800 px-4 py-3 rounded-2xl rounded-bl-md shadow-sm border border-gray-100 dark:border-gray-700 text-gray-900 dark:text-gray-100">
+                    <p className="whitespace-pre-wrap">{content}<span className="animate-pulse">▌</span></p>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function TypingIndicator() {
     return (
         <div className="flex justify-start animate-fade-in">
@@ -93,7 +105,7 @@ function TypingIndicator() {
 export function Chat() {
     const [input, setInput] = useState('');
     const messagesEndRef = useRef<HTMLDivElement>(null);
-    const { messages, sendMessage, isLoading } = useChat();
+    const { messages, sendMessage, isLoading, streamingContent } = useChat();
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -101,7 +113,7 @@ export function Chat() {
 
     useEffect(() => {
         scrollToBottom();
-    }, [messages, isLoading]);
+    }, [messages, isLoading, streamingContent]);
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
@@ -131,7 +143,7 @@ export function Chat() {
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-                {messages.length === 0 ? (
+                {messages.length === 0 && !streamingContent ? (
                     <div className="flex flex-col items-center justify-center h-full text-center text-gray-500 dark:text-gray-400">
                         <div className="text-6xl mb-4">📚</div>
                         <h3 className="text-lg font-medium mb-2">Start a conversation</h3>
@@ -144,7 +156,8 @@ export function Chat() {
                         <MessageBubble key={message.id} message={message} />
                     ))
                 )}
-                {isLoading && <TypingIndicator />}
+                {streamingContent && <StreamingBubble content={streamingContent} />}
+                {isLoading && !streamingContent && <TypingIndicator />}
                 <div ref={messagesEndRef} />
             </div>
 
